@@ -15,12 +15,14 @@ const CONFIG = {
   autoTrading: false
 };
 
-// Basic status endpoint
+const shrine = io('https://sol.shrine.trade');// Basic status endpoint
 app.get('/api/status', (_req, res) => {
-  res.json({
-    ok: true,
-    message: 'PumpSwap scanner server is online',
-    source: CONFIG.source,
+   shrine.emit('subscribe_migrations', { res.json({
+       protocols: ['PUMPFUN']ok: true,
+     });message: 'PumpSwap scanner server is online',
+     shrine.on('migration', (migration) => {
+  console.log('NEW PUMPSWAP MIGRATION:', migration);
+});source: CONFIG.source,
     autoTrading: CONFIG.autoTrading,
     maxMonitorMinutes: CONFIG.maxMonitorMinutes,
     orangeThreshold: CONFIG.orangeThreshold,
