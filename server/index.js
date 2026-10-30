@@ -38,3 +38,9 @@ app.get('/health', (_req, res) => {
   app.listen(PORT, () => {
   console.log(`PumpSwap Momentum Scanner running on port ${PORT}`);
 });
+function monitorToken(mint, pool) {
+  console.log('MONITORING PUMPSWAP TOKEN:', mint, pool);
+         setTimeout(() => {
+               console.log('STOP MONITORING:', mint);
+             }, CONFIG.maxMonitorMinutes * 60 * 1000);
+}
