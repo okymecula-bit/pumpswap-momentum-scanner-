@@ -33,7 +33,7 @@ app.get('/api/status', (_req, res) => {
   });
 shrine.on('migration', (migration) => {
   console.log('NEW PUMPSWAP MIGRATION:', migration);
-  monitorToken(migration.mint, migration.new_pool);
+  monitorToken(migration.mint, migration.pool);
   });
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
