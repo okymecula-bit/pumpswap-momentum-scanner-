@@ -17,23 +17,24 @@ const CONFIG = {
 
 const shrine = io('https://sol.shrine.trade');// Basic status endpoint
 app.get('/api/status', (_req, res) => {
-   shrine.emit('subscribe_migrations', { res.json({
-       protocols: ['PUMPFUN']ok: true,
-     });message: 'PumpSwap scanner server is online',
-     shrine.on('migration', (migration) => {
-  console.log('NEW PUMPSWAP MIGRATION:', migration);
-});source: CONFIG.source,
+     shrine.emit('subscribe_migrations', {});
+         res.json({
+         protocols: ['PUMPFUN'],
+         ok: true,
+      source: CONFIG.source,
     autoTrading: CONFIG.autoTrading,
-    maxMonitorMinutes: CONFIG.maxMonitorMinutes,
-    orangeThreshold: CONFIG.orangeThreshold,
-    signals: ['GREEN', 'ORANGE', 'ELITE_SNIPER']
+        maxMonitorMinutes: CONFIG.maxMonitorMinutes,
+        orangeThreshold: CONFIG.orangeThreshold,
+        signals: ['GREEN', 'ORANGE', 'ELITE_SNIPER']
+      });
   });
-});
-
+shrine.on('migration', (migration) => {
+  console.log('NEW PUMPSWAP MIGRATION:', migration);
+  monitorToken(migration.mint, migration.new_pool);
+  });
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
-
-app.listen(PORT, () => {
+  app.listen(PORT, () => {
   console.log(`PumpSwap Momentum Scanner running on port ${PORT}`);
 });
