@@ -18,6 +18,7 @@ const CONFIG = {
 const shrine = io('https://sol.shrine.trade');// Basic status endpoint
 shrine.on('connect', () => {
   console.log('SHRINE CONNECTED:', shrine.id);
+  shrine.emit('subscribe_migrations', {});
 });
 app.get('/api/status', (_req, res) => {
      shrine.emit('subscribe_migrations', {});
