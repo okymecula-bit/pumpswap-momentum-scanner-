@@ -45,7 +45,17 @@ app.get('/health', (_req, res) => {
 });
 function monitorToken(mint, pool) {
   console.log('MONITORING PUMPSWAP TOKEN:', mint, pool);
-         setTimeout(() => {
-               console.log('STOP MONITORING:', mint);
-             }, CONFIG.maxMonitorMinutes * 60 * 1000);
+
+  shrine.emit('subscribe', { mint }, (ack) => {
+    console.log('TOKEN SUBSCRIPTION:', mint, ack);
+  });
+
+  setTimeout(() => {
+    shrine.emit('unsubscribe', { pool });
+    console.log('STOP MONITORING:', mint);
+  }, CONFIG.maxMonitorMinutes * 60 * 1000);
 }
+
+shrine.on('token_update', (update) => {
+  console.log('TOKEN UPDATE:', update);
+});
