@@ -9,6 +9,9 @@ app.use(express.static('public'));
 
 const CONFIG = {
   maxMonitorMinutes: 10,
+
+  // Strategy minimums
+  minMcapUSD: 7000,
   minLiquidityUSD: 10000,
 
   orangeThreshold: 0.70,
@@ -110,6 +113,7 @@ function getTradeWallet(trade) {
   return (
     trade?.wallet ||
     trade?.trader ||
+    trade?.user ||
     null
   );
 }
@@ -117,14 +121,17 @@ function getTradeWallet(trade) {
 function getTradeSOL(trade) {
   return safeNumber(
     trade?.sol_amount ??
-    trade?.solAmount
+    trade?.solAmount ??
+    trade?.amount
   );
 }
 
 function getStateByPool(pool) {
-  for (
-    const state of monitored.values()
-  ) {
+  if (!pool) {
+    return null;
+  }
+
+  for (const state of monitored.values()) {
     if (state.pool === pool) {
       return state;
     }
@@ -398,6 +405,8 @@ shrine.on(
       const mint =
         migration?.mint;
 
+      // IMPORTANT:
+      // Shrine migration data uses "pool".
       const pool =
         migration?.pool;
 
@@ -406,7 +415,7 @@ shrine.on(
         !pool
       ) {
         console.log(
-          'MIGRATION MISSING MINT OR NEW POOL'
+          'MIGRATION MISSING MINT OR POOL'
         );
 
         return;
@@ -526,7 +535,9 @@ async function monitorToken(
   mint,
   pool
 ) {
-  if (monitored.has(mint)) {
+  if (
+    monitored.has(mint)
+  ) {
     console.log(
       'ALREADY MONITORING:',
       mint
@@ -936,13 +947,17 @@ function updateWalletStats(
       wallet
     );
 
-  if (side === 'buy') {
+  if (
+    side === 'buy'
+  ) {
     stats.buys++;
     stats.buySOL +=
       solAmount;
   }
 
-  if (side === 'sell') {
+  if (
+    side === 'sell'
+  ) {
     stats.sells++;
     stats.sellSOL +=
       solAmount;
@@ -1157,6 +1172,8 @@ function calculateScore(state) {
     score += 15;
   }
 
+  // Buyer count contributes to the score,
+  // but is NOT a hard minimum requirement.
   if (
     state.uniqueBuyers.size >= 5
   ) {
@@ -1204,20 +1221,24 @@ function calculateScore(state) {
       state.latestPriceUSD /
       state.firstPriceUSD;
 
-    if (ratio >= 1.30) {
+    if (
+      ratio >= 1.30
+    ) {
       score += 20;
-    } else if (ratio >= 1.15) {
+    } else if (
+      ratio >= 1.15
+    ) {
       score += 15;
-    } else if (ratio >= 1.05) {
+    } else if (
+      ratio >= 1.05
+    ) {
       score += 10;
     }
   }
 
+  // Market cap is NOT a $100k requirement.
+  // The only minimum MC is $7,000.
   if (
-    state.mcapUSD >= 100000
-  ) {
-    score += 15;
-  } else if (
     state.mcapUSD >= 50000
   ) {
     score += 12;
@@ -1226,7 +1247,7 @@ function calculateScore(state) {
   ) {
     score += 8;
   } else if (
-    state.mcapUSD > 0
+    state.mcapUSD >= CONFIG.minMcapUSD
   ) {
     score += 4;
   }
@@ -1249,7 +1270,9 @@ function calculateScore(state) {
   }
 
   const concentration =
-    getLargestBuyerShare(state);
+    getLargestBuyerShare(
+      state
+    );
 
   if (
     concentration <= 0.30
@@ -1267,10 +1290,112 @@ function calculateScore(state) {
     score,
     percentage:
       score / maxScore,
-    buyPressure,
+        buyPressure,
     buyerGrowth,
     concentration
   };
+}
+
+// ------------------------------
+// SAFETY CHECKS
+// ------------------------------
+
+function hasHeavyDumping(state) {
+  if (
+    state.sellVolumeSOL <= 0
+  ) {
+    return false;
+  }
+
+  if (
+    state.buyVolumeSOL <= 0
+  ) {
+    return state.sellVolumeSOL >= 10;
+  }
+
+  return (
+    state.sellVolumeSOL >=
+    state.buyVolumeSOL * 3
+  );
+}
+
+function getSignalReasons(
+  state,
+  result
+) {
+  const reasons = [];
+
+  if (
+    state.liquidityUSD >=
+    CONFIG.minLiquidityUSD * 2
+  ) {
+    reasons.push(
+      'Strong liquidity'
+    );
+  } else if (
+    state.liquidityUSD >=
+    CONFIG.minLiquidityUSD
+  ) {
+    reasons.push(
+      'Liquidity above $10k'
+    );
+  }
+
+  if (
+    result.buyPressure >= 2
+  ) {
+    reasons.push(
+      'Buyers strongly outweigh sellers'
+    );
+  } else if (
+    result.buyPressure >= 1.25
+  ) {
+    reasons.push(
+      'Positive buyer pressure'
+    );
+  }
+
+  if (
+    result.buyerGrowth >= 3
+  ) {
+    reasons.push(
+      'Unique buyers are accelerating'
+    );
+  } else if (
+    result.buyerGrowth >= 1
+  ) {
+    reasons.push(
+      'Holder growth is increasing'
+    );
+  }
+
+  if (
+    state.uniqueBuyers.size >= 3
+  ) {
+    reasons.push(
+      'Multiple unique buyers'
+    );
+  }
+
+  if (
+    result.concentration <= 0.30
+  ) {
+    reasons.push(
+      'Buyer distribution is healthy'
+    );
+  }
+
+  if (
+    state.latestPriceUSD >
+      state.firstPriceUSD &&
+    state.firstPriceUSD > 0
+  ) {
+    reasons.push(
+      'Price momentum is positive'
+    );
+  }
+
+  return reasons;
 }
 
 // ------------------------------
@@ -1282,11 +1407,536 @@ function evaluateToken(state) {
     return;
   }
 
-  // Below $10k liquidity:
-  // silently ignore.
+  // Minimum market cap is $7,000.
+  // No $100,000 minimum exists.
   if (
-    state.liquidityUSD > 0 &&
-    state.liquidityUSD <
-      CONFIG.minLiquidityUSD
+    state.mcapUSD > 0 &&
+    state.mcapUSD <
+      CONFIG.minMcapUSD
   ) {
-   
+    return;
+  }
+
+  // Do not score tokens until liquidity
+  // can be measured.
+  if (
+    state.liquidityUSD <= 0
+  ) {
+    return;
+  }
+
+  // Thin liquidity is silently ignored.
+  if (
+    state.liquidityUSD <
+    CONFIG.minLiquidityUSD
+  ) {
+    return;
+  }
+
+  // Heavy dumping is a hard safety blocker.
+  if (
+    hasHeavyDumping(state)
+  ) {
+    return;
+  }
+
+  const result =
+    calculateScore(state);
+
+  if (
+    result.percentage >=
+      CONFIG.greenThreshold &&
+    !state.greenSent &&
+    !state.normalAlertSent
+  ) {
+    state.greenSent = true;
+    state.normalAlertSent = true;
+
+    sendNormalAlert(
+      state,
+      'GREEN',
+      result
+    );
+
+    return;
+  }
+
+  if (
+    result.percentage >=
+      CONFIG.orangeThreshold &&
+    !state.orangeSent &&
+    !state.greenSent &&
+    !state.normalAlertSent
+  ) {
+    state.orangeSent = true;
+    state.normalAlertSent = true;
+
+    sendNormalAlert(
+      state,
+      'ORANGE',
+      result
+    );
+  }
+}
+
+// ------------------------------
+// NORMAL ALERT
+// ------------------------------
+
+async function sendNormalAlert(
+  state,
+  signal,
+  result
+) {
+  if (
+    normalAlertsSent.has(
+      state.mint
+    )
+  ) {
+    return;
+  }
+
+  normalAlertsSent.add(
+    state.mint
+  );
+
+  const reasons =
+    getSignalReasons(
+      state,
+      result
+    );
+
+  const reasonText =
+    reasons.length > 0
+      ? reasons
+          .map(
+            reason =>
+              `• ${reason}`
+          )
+          .join('\n')
+      : '• Momentum conditions triggered';
+
+  const message =
+    `${signal === 'GREEN' ? '🟢' : '🟠'} ${signal} PUMPSWAP\n\n` +
+    `CA: ${state.mint}\n` +
+    `MCap: $${Math.round(
+      state.mcapUSD
+    ).toLocaleString()}\n` +
+    `Price: $${state.latestPriceUSD}\n` +
+    `Liquidity: $${Math.round(
+      state.liquidityUSD
+    ).toLocaleString()}\n` +
+    `Buyers: ${state.uniqueBuyers.size}\n` +
+    `Sellers: ${state.uniqueSellers.size}\n` +
+    `Buys: ${state.buys}\n` +
+    `Sells: ${state.sells}\n` +
+    `Buy pressure: ${result.buyPressure.toFixed(2)}x\n` +
+    `Buyer growth: ${result.buyerGrowth}\n` +
+    `Buyer concentration: ${(result.concentration * 100).toFixed(1)}%\n` +
+    `Score: ${Math.round(
+      result.percentage * 100
+    )}%\n\n` +
+    `WHY IT TRIGGERED:\n` +
+    `${reasonText}\n\n` +
+    `⚠️ Signal only — not a profit guarantee.`;
+
+  console.log(
+    `${signal} SIGNAL:`,
+    state.mint,
+    result
+  );
+
+  await sendTelegram(
+    message
+  );
+}
+
+// ------------------------------
+// ELITE WALLET TRACKING
+// ------------------------------
+
+function updateEliteWallet(
+  wallet,
+  state,
+  side,
+  solAmount
+) {
+  if (!wallet) {
+    return;
+  }
+
+  if (
+    !eliteWallets.has(wallet)
+  ) {
+    eliteWallets.set(
+      wallet,
+      {
+        trades: 0,
+        buys: 0,
+        sells: 0,
+        buySOL: 0,
+        sellSOL: 0,
+        tokensSeen: new Set(),
+        successfulTokens: new Set(),
+        firstSeen: Date.now(),
+        lastSeen: Date.now(),
+        suspiciousScore: 0
+      }
+    );
+  }
+
+  const stats =
+    eliteWallets.get(
+      wallet
+    );
+
+  stats.trades++;
+  stats.lastSeen =
+    Date.now();
+
+  stats.tokensSeen.add(
+    state.mint
+  );
+
+  if (
+    side === 'buy'
+  ) {
+    stats.buys++;
+    stats.buySOL +=
+      solAmount;
+  }
+
+  if (
+    side === 'sell'
+  ) {
+    stats.sells++;
+    stats.sellSOL +=
+      solAmount;
+  }
+
+  if (
+    stats.trades >= 2 &&
+    stats.buys >= 2 &&
+    stats.sellSOL >
+      stats.buySOL * 3
+  ) {
+    stats.suspiciousScore++;
+  }
+}
+
+// ------------------------------
+// ELITE SNIPER
+// ------------------------------
+
+async function evaluateEliteSniper(
+  wallet
+) {
+  if (!wallet) {
+    return;
+  }
+
+  const stats =
+    eliteWallets.get(
+      wallet
+    );
+
+  if (!stats) {
+    return;
+  }
+
+  if (
+    stats.trades <
+    CONFIG.eliteMinTrades
+  ) {
+    return;
+  }
+
+  if (
+    stats.buys <
+    CONFIG.eliteMinWins
+  ) {
+    return;
+  }
+
+  if (
+    stats.suspiciousScore >= 3
+  ) {
+    return;
+  }
+
+  const winRate =
+    stats.buys /
+    Math.max(
+      1,
+      stats.trades
+    );
+
+  if (
+    winRate < 0.50
+  ) {
+    return;
+  }
+
+  const now =
+    Date.now();
+
+  const lastAlert =
+    eliteAlertsSent.get(
+      wallet
+    ) || 0;
+
+  if (
+    now - lastAlert <
+    CONFIG.eliteCooldownMinutes *
+      60 *
+      1000
+  ) {
+    return;
+  }
+
+  eliteAlertsSent.set(
+    wallet,
+    now
+  );
+
+  const message =
+    `🎯 ELITE SNIPER WALLET\n\n` +
+    `Wallet: ${wallet}\n` +
+    `Short: ${shortAddress(wallet)}\n` +
+    `Trades: ${stats.trades}\n` +
+    `Buys: ${stats.buys}\n` +
+    `Sells: ${stats.sells}\n` +
+    `Win rate: ${(winRate * 100).toFixed(1)}%\n` +
+    `Tokens seen: ${stats.tokensSeen.size}\n\n` +
+    `⚠️ Wallet signal only — not a profit guarantee.`;
+
+  console.log(
+    'ELITE SNIPER WALLET:',
+    shortAddress(wallet),
+    {
+      trades: stats.trades,
+      buys: stats.buys,
+      sells: stats.sells,
+      tokensSeen:
+        stats.tokensSeen.size,
+      winRate
+    }
+  );
+
+  await sendTelegram(
+    message
+  );
+}
+
+// ------------------------------
+// CLEANUP
+// ------------------------------
+
+setInterval(
+  () => {
+    const cutoff =
+      Date.now() -
+      CONFIG.maxMonitorMinutes *
+        60 *
+        1000;
+
+    for (
+      const state
+      of monitored.values()
+    ) {
+      if (
+        state.startedAt <
+        cutoff
+      ) {
+        unsubscribeToken(
+          state
+        );
+      }
+    }
+
+    if (
+      normalAlertsSent.size >
+      10000
+    ) {
+      normalAlertsSent.clear();
+    }
+
+    if (
+      devSellAlertsSent.size >
+      10000
+    ) {
+      devSellAlertsSent.clear();
+    }
+
+    if (
+      eliteAlertsSent.size >
+      10000
+    ) {
+      eliteAlertsSent.clear();
+    }
+
+    const walletCutoff =
+      Date.now() -
+      24 *
+      60 *
+      60 *
+      1000;
+
+    for (
+      const [
+        wallet,
+        stats
+      ] of eliteWallets
+    ) {
+      if (
+        stats.lastSeen <
+        walletCutoff
+      ) {
+        eliteWallets.delete(
+          wallet
+        );
+      }
+    }
+  },
+  60 * 1000
+);
+
+// ------------------------------
+// STATUS
+// ------------------------------
+
+app.get(
+  '/api/status',
+  (_req, res) => {
+    res.json({
+      ok: true,
+      protocols: ['PUMPFUN'],
+      source: CONFIG.source,
+      autoTrading:
+        CONFIG.autoTrading,
+
+      scannerActive,
+
+      minMcapUSD:
+        CONFIG.minMcapUSD,
+
+      maxMonitorMinutes:
+        CONFIG.maxMonitorMinutes,
+
+      minLiquidityUSD:
+        CONFIG.minLiquidityUSD,
+
+      orangeThreshold:
+        CONFIG.orangeThreshold,
+
+      greenThreshold:
+        CONFIG.greenThreshold,
+
+      monitoredTokens:
+        monitored.size,
+
+      eliteWallets:
+        eliteWallets.size,
+
+      telegramEnabled,
+
+      solPriceUSD,
+
+      signals: [
+        'GREEN',
+        'ORANGE',
+        'ELITE_SNIPER',
+        'DEV_SELL'
+      ]
+    });
+  }
+);
+
+// ------------------------------
+// HEALTH
+// ------------------------------
+
+app.get(
+  '/health',
+  (_req, res) => {
+    res.json({
+      ok: true
+    });
+  }
+);
+
+// ------------------------------
+// GLOBAL ERROR HANDLING
+// ------------------------------
+
+process.on(
+  'uncaughtException',
+  (error) => {
+    console.log(
+      'GLOBAL ERROR:',
+      error.message
+    );
+  }
+);
+
+process.on(
+  'unhandledRejection',
+  (error) => {
+    console.log(
+      'UNHANDLED PROMISE:',
+      error
+    );
+  }
+);
+
+// ------------------------------
+// START SERVER
+// ------------------------------
+
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `PumpSwap Momentum Scanner running on port ${PORT}`
+    );
+
+    console.log(
+      'SOURCE:',
+      CONFIG.source
+    );
+
+    console.log(
+      'AUTO TRADING:',
+      CONFIG.autoTrading
+    );
+
+    console.log(
+      'TELEGRAM ENABLED:',
+      telegramEnabled
+    );
+
+    console.log(
+      'MIN MC:',
+      CONFIG.minMcapUSD
+    );
+
+    console.log(
+      'MONITOR WINDOW:',
+      CONFIG.maxMonitorMinutes,
+      'minutes'
+    );
+
+    console.log(
+      'MIN LIQUIDITY:',
+      CONFIG.minLiquidityUSD
+    );
+
+    console.log(
+      'SCHEDULE:',
+      CONFIG.workMinutes,
+      'minutes ON /',
+      CONFIG.restMinutes,
+      'minutes OFF'
+    );
+  }
+);
