@@ -2,7 +2,7 @@ import express from 'express';
 import { io } from 'socket.io-client';
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 app.use(express.json());
 app.use(express.static('public'));
@@ -28,6 +28,10 @@ const CONFIG = {
   autoTrading: false
 };
 
+// ------------------------------
+// TELEGRAM CONFIG
+// ------------------------------
+
 const TELEGRAM_BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN || '';
 
@@ -35,13 +39,24 @@ const TELEGRAM_CHAT_ID =
   process.env.TELEGRAM_CHAT_ID || '';
 
 const telegramEnabled =
-  TELEGRAM_BOT_TOKEN.length > 0 &&
-  TELEGRAM_CHAT_ID.length > 0;
+  Boolean(
+    TELEGRAM_BOT_TOKEN &&
+    TELEGRAM_CHAT_ID
+  );
+
+// ------------------------------
+// SHRINE
+// ------------------------------
 
 const shrine = io(
   'https://sol.shrine.trade',
   {
-    transports: ['websocket']
+    transports: ['websocket'],
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 10000,
+    timeout: 20000
   }
 );
 
@@ -50,12 +65,23 @@ const shrine = io(
 // ------------------------------
 
 const monitored = new Map();
-const normalAlertsSent = new Set();
-const devSellAlertsSent = new Set();
-const eliteAlertsSent = new Map();
-const eliteWallets = new Map();
+const poolToMint = new Map();
 
-let scannerStartedAt = Date.now();
+const normalAlertsSent =
+  new Set();
+
+const devSellAlertsSent =
+  new Set();
+
+const eliteAlertsSent =
+  new Map();
+
+const eliteWallets =
+  new Map();
+
+const scannerStartedAt =
+  Date.now();
+
 let scannerActive = true;
 let solPriceUSD = 0;
 
@@ -63,23 +89,30 @@ let solPriceUSD = 0;
 // HELPERS
 // ------------------------------
 
-function safeNumber(value, fallback = 0) {
-  const number = Number(value);
+function safeNumber(
+  value,
+  fallback = 0
+) {
+  const n = Number(value);
 
-  return Number.isFinite(number)
-    ? number
+  return Number.isFinite(n)
+    ? n
     : fallback;
 }
 
-function shortAddress(address) {
+function shortAddress(
+  address
+) {
   if (
-    !address ||
-    typeof address !== 'string'
+    typeof address !== 'string' ||
+    !address
   ) {
     return 'unknown';
   }
 
-  if (address.length <= 12) {
+  if (
+    address.length <= 12
+  ) {
     return address;
   }
 
@@ -90,13 +123,16 @@ function shortAddress(address) {
   );
 }
 
-function getAction(trade) {
-  if (trade?.is_buy === true) {
-    return 'buy';
-  }
-
-  if (trade?.is_buy === false) {
-    return 'sell';
+function getAction(
+  trade
+) {
+  if (
+    typeof trade?.is_buy ===
+    'boolean'
+  ) {
+    return trade.is_buy
+      ? 'buy'
+      : 'sell';
   }
 
   if (
@@ -109,7 +145,9 @@ function getAction(trade) {
   return null;
 }
 
-function getTradeWallet(trade) {
+function getTradeWallet(
+  trade
+) {
   return (
     trade?.wallet ||
     trade?.trader ||
@@ -118,121 +156,197 @@ function getTradeWallet(trade) {
   );
 }
 
-function getTradeSOL(trade) {
+function getTradeSOL(
+  trade
+) {
   return safeNumber(
     trade?.sol_amount ??
     trade?.solAmount ??
+    trade?.quote_amount ??
+    trade?.quoteAmount ??
     trade?.amount
   );
 }
 
-function getStateByPool(pool) {
-  if (!pool) {
+// ------------------------------
+// TOKEN STATE
+// ------------------------------
+
+function getTokenState(
+  mint
+) {
+  if (!mint) {
     return null;
   }
 
-  for (const state of monitored.values()) {
-    if (state.pool === pool) {
-      return state;
+  let state =
+    monitored.get(mint);
+
+  if (state) {
+    return state;
+  }
+
+  state = {
+    mint,
+
+    pool: null,
+
+    startedAt:
+      Date.now(),
+
+    firstTradeAt:
+      Date.now(),
+
+    lastTradeAt: 0,
+    lastUpdateAt: 0,
+
+    priceUSD: 0,
+    mcapUSD: 0,
+
+    liquidityUSD: 0,
+    liquidityKnown: false,
+
+    quoteMint: null,
+    quoteInPool: 0,
+    tokensInPool: 0,
+
+    buys: 0,
+    sells: 0,
+
+    buyVolumeSOL: 0,
+    sellVolumeSOL: 0,
+
+    uniqueBuyers:
+      new Set(),
+
+    uniqueSellers:
+      new Set(),
+
+    walletStats:
+      new Map(),
+
+    recentTrades: [],
+
+    buyerTimeline: [],
+
+    firstPriceUSD: 0,
+    latestPriceUSD: 0,
+    highestPriceUSD: 0,
+
+    devWallet: null,
+
+    metadata: null,
+
+    normalAlertSent: false,
+    greenSent: false,
+    orangeSent: false,
+
+    lastTradeSignature:
+      null,
+
+    stopTimer: null
+  };
+
+  monitored.set(
+    mint,
+    state
+  );
+
+  return state;
+}
+
+// ------------------------------
+// FIND TOKEN BY MINT OR POOL
+// ------------------------------
+
+function findState(
+  event
+) {
+  const mint =
+    event?.mint;
+
+  const pool =
+    event?.pool;
+
+  if (
+    mint &&
+    monitored.has(mint)
+  ) {
+    return monitored.get(
+      mint
+    );
+  }
+
+  if (
+    pool &&
+    poolToMint.has(pool)
+  ) {
+    return monitored.get(
+      poolToMint.get(pool)
+    );
+  }
+
+  if (pool) {
+    for (
+      const state
+      of monitored.values()
+    ) {
+      if (
+        state.pool === pool
+      ) {
+        return state;
+      }
     }
   }
 
   return null;
 }
 
-function getTokenState(mint) {
-  if (!monitored.has(mint)) {
-    monitored.set(
-      mint,
-      {
-        mint,
-        pool: null,
-
-        startedAt: Date.now(),
-
-        priceUSD: 0,
-        mcapUSD: 0,
-        liquidityUSD: 0,
-
-        quoteMint: null,
-        quoteInPool: 0,
-        tokensInPool: 0,
-
-        buys: 0,
-        sells: 0,
-
-        buyVolumeSOL: 0,
-        sellVolumeSOL: 0,
-
-        uniqueBuyers: new Set(),
-        uniqueSellers: new Set(),
-
-        walletStats: new Map(),
-
-        firstPriceUSD: 0,
-        latestPriceUSD: 0,
-        highestPriceUSD: 0,
-
-        firstTradeAt: Date.now(),
-        lastTradeAt: 0,
-        lastUpdateAt: 0,
-
-        recentTrades: [],
-        buyerTimeline: [],
-
-        devWallet: null,
-        creatorLoaded: false,
-        metadata: null,
-
-        normalAlertSent: false,
-        greenSent: false,
-        orangeSent: false,
-
-        latestTrade: null,
-        stopTimer: null
-      }
-    );
-  }
-
-  return monitored.get(mint);
-}
-
 // ------------------------------
 // TELEGRAM
 // ------------------------------
 
-async function sendTelegram(message) {
-  if (!telegramEnabled) {
-    console.log(
-      'TELEGRAM NOT CONFIGURED'
-    );
-
+async function sendTelegram(
+  message
+) {
+  if (
+    !telegramEnabled
+  ) {
     return false;
   }
 
   try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-      {
-        method: 'POST',
+    const response =
+      await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          method: 'POST',
 
-        headers: {
-          'Content-Type':
-            'application/json'
-        },
+          headers: {
+            'Content-Type':
+              'application/json'
+          },
 
-        body: JSON.stringify({
-          chat_id: TELEGRAM_CHAT_ID,
-          text: message,
-          disable_web_page_preview: true
-        })
-      }
-    );
+          body:
+            JSON.stringify({
+              chat_id:
+                TELEGRAM_CHAT_ID,
+
+              text:
+                message,
+
+              disable_web_page_preview:
+                true
+            })
+        }
+      );
 
     const result =
       await response.json();
 
-    if (!result.ok) {
+    if (
+      !result.ok
+    ) {
       console.log(
         'TELEGRAM ERROR:',
         result
@@ -245,7 +359,7 @@ async function sendTelegram(message) {
   } catch (error) {
     console.log(
       'TELEGRAM SEND FAILED:',
-      error.message
+      error?.message || error
     );
 
     return false;
@@ -279,48 +393,26 @@ function isScannerActive() {
   );
 }
 
-setInterval(() => {
-  const previous =
-    scannerActive;
+setInterval(
+  () => {
+    const previous =
+      scannerActive;
 
-  scannerActive =
-    isScannerActive();
+    scannerActive =
+      isScannerActive();
 
-  if (
-    previous !== scannerActive
-  ) {
-    console.log(
+    if (
+      previous !==
       scannerActive
-        ? 'SCANNER ACTIVE: 3-HOUR WORK PERIOD STARTED'
-        : 'SCANNER RESTING: 2-HOUR REST PERIOD STARTED'
-    );
-  }
-}, 60 * 1000);
-
-// ------------------------------
-// SOL PRICE
-// ------------------------------
-
-shrine.on(
-  'sol_price',
-  (data) => {
-    try {
-      solPriceUSD =
-        safeNumber(
-          data?.priceUSD
-        );
-
+    ) {
       console.log(
-        'SOL PRICE:',
-        solPriceUSD
-      );
-    } catch (error) {
-      console.log(
-        'SOL PRICE ERROR:',
-        error.message
+        scannerActive
+          ? 'SCANNER ACTIVE: 3-HOUR WORK PERIOD STARTED'
+          : 'SCANNER RESTING: 2-HOUR REST PERIOD STARTED'
       );
     }
-  }
+  },
+  60 * 1000
 );
 
 // ------------------------------
@@ -338,7 +430,9 @@ shrine.on(
     shrine.emit(
       'subscribe_migrations',
       {
-        protocols: ['PUMPFUN']
+        protocols: [
+          'PUMPFUN'
+        ]
       },
       (ack) => {
         console.log(
@@ -356,13 +450,17 @@ shrine.on(
           ack
         );
 
+        const price =
+          safeNumber(
+            ack?.snapshot
+              ?.priceUSD
+          );
+
         if (
-          ack?.snapshot?.priceUSD
+          price > 0
         ) {
           solPriceUSD =
-            safeNumber(
-              ack.snapshot.priceUSD
-            );
+            price;
         }
       }
     );
@@ -374,7 +472,8 @@ shrine.on(
   (error) => {
     console.log(
       'SHRINE CONNECTION ERROR:',
-      error.message
+      error?.message ||
+        error
     );
   }
 );
@@ -385,6 +484,47 @@ shrine.on(
     console.log(
       'SHRINE DISCONNECTED:',
       reason
+    );
+  }
+);
+
+// ------------------------------
+// SOL PRICE
+// ------------------------------
+
+shrine.on(
+  'sol_price',
+  (data) => {
+    const price =
+      safeNumber(
+        data?.priceUSD ??
+        data?.price
+      );
+
+    if (
+      price > 0
+    ) {
+      solPriceUSD =
+        price;
+
+      console.log(
+        'SOL PRICE:',
+        solPriceUSD
+      );
+    }
+  }
+);
+
+// ------------------------------
+// SHRINE SUBSCRIPTION ERRORS
+// ------------------------------
+
+shrine.on(
+  'subscription_error',
+  (error) => {
+    console.log(
+      'SHRINE SUBSCRIPTION ERROR:',
+      error
     );
   }
 );
@@ -405,9 +545,9 @@ shrine.on(
       const mint =
         migration?.mint;
 
-      // IMPORTANT:
-      // Shrine migration data uses "pool".
       const pool =
+        migration?.new_pool ||
+        migration?.toPool ||
         migration?.pool;
 
       if (
@@ -415,13 +555,20 @@ shrine.on(
         !pool
       ) {
         console.log(
-          'MIGRATION MISSING MINT OR POOL'
+          'MIGRATION MISSING MINT OR NEW POOL:',
+          {
+            mint,
+            pool,
+            migration
+          }
         );
 
         return;
       }
 
-      if (!scannerActive) {
+      if (
+        !scannerActive
+      ) {
         console.log(
           'MIGRATION SEEN DURING REST PERIOD:',
           mint
@@ -437,7 +584,9 @@ shrine.on(
     } catch (error) {
       console.log(
         'MIGRATION HANDLER ERROR:',
-        error.message
+        error?.stack ||
+          error?.message ||
+          error
       );
     }
   }
@@ -453,12 +602,9 @@ async function loadMetadata(
 ) {
   try {
     const params =
-      new URLSearchParams();
-
-    params.set(
-      'mint',
-      mint
-    );
+      new URLSearchParams({
+        mint
+      });
 
     if (pool) {
       params.set(
@@ -472,7 +618,9 @@ async function loadMetadata(
         `https://sol.shrine.trade/metadata?${params.toString()}`
       );
 
-    if (!response.ok) {
+    if (
+      !response.ok
+    ) {
       console.log(
         'METADATA HTTP ERROR:',
         response.status,
@@ -486,30 +634,48 @@ async function loadMetadata(
       await response.json();
 
     const state =
-      getTokenState(mint);
+      getTokenState(
+        mint
+      );
+
+    if (!state) {
+      return null;
+    }
 
     state.metadata =
       metadata;
 
-    state.creatorLoaded =
-      true;
+    state.devWallet =
+      metadata?.creator ||
+      metadata?.pumpfun?.creator ||
+      state.devWallet;
 
-    if (
-      metadata?.creator
-    ) {
-      state.devWallet =
-        metadata.creator;
-    }
+    state.quoteMint =
+      metadata?.quote ||
+      state.quoteMint;
 
     console.log(
       'TOKEN METADATA:',
       {
         mint,
-        pool: metadata?.pool,
-        program: metadata?.program,
-        creator: metadata?.creator,
-        name: metadata?.name,
-        symbol: metadata?.symbol,
+        pool:
+          metadata?.pool,
+
+        program:
+          metadata?.program,
+
+        creator:
+          state.devWallet,
+
+        name:
+          metadata?.name,
+
+        symbol:
+          metadata?.symbol,
+
+        quote:
+          metadata?.quote,
+
         graduated:
           metadata?.graduated
       }
@@ -520,11 +686,82 @@ async function loadMetadata(
     console.log(
       'METADATA ERROR:',
       mint,
-      error.message
+      error?.message ||
+        error
     );
 
     return null;
   }
+}
+
+// ------------------------------
+// SUBSCRIBE TOKEN
+// ------------------------------
+
+async function subscribeToken(
+  state
+) {
+  if (
+    !state?.pool
+  ) {
+    return;
+  }
+
+  shrine.emit(
+    'subscribe',
+    {
+      pool:
+        state.pool
+    },
+    (ack) => {
+      console.log(
+        'TOKEN PRICE SUBSCRIPTION:',
+        state.mint,
+        ack
+      );
+
+      if (
+        ack?.error
+      ) {
+        console.log(
+          'PRICE SUBSCRIPTION FAILED:',
+          state.mint,
+          ack
+        );
+      }
+    }
+  );
+
+  shrine.emit(
+    'subscribe_trades',
+    {
+      pool:
+        state.pool
+    },
+    (ack) => {
+      console.log(
+        'TOKEN TRADE SUBSCRIPTION:',
+        state.mint,
+        ack
+      );
+
+      if (
+        ack?.error
+      ) {
+        console.log(
+          'TRADE SUBSCRIPTION FAILED:',
+          state.mint,
+          ack
+        );
+      } else {
+        console.log(
+          'TRADE STREAM ACTIVE:',
+          state.mint,
+          state.pool
+        );
+      }
+    }
+  );
 }
 
 // ------------------------------
@@ -535,9 +772,27 @@ async function monitorToken(
   mint,
   pool
 ) {
-  if (
-    monitored.has(mint)
-  ) {
+  const existing =
+    monitored.get(mint);
+
+  if (existing) {
+    if (
+      !existing.pool &&
+      pool
+    ) {
+      existing.pool =
+        pool;
+
+      poolToMint.set(
+        pool,
+        mint
+      );
+
+      await subscribeToken(
+        existing
+      );
+    }
+
     console.log(
       'ALREADY MONITORING:',
       mint
@@ -547,16 +802,17 @@ async function monitorToken(
   }
 
   const state =
-    getTokenState(mint);
+    getTokenState(
+      mint
+    );
 
   state.pool =
     pool;
 
-  state.startedAt =
-    Date.now();
-
-  state.firstTradeAt =
-    Date.now();
+  poolToMint.set(
+    pool,
+    mint
+  );
 
   console.log(
     'MONITORING PUMPSWAP TOKEN:',
@@ -564,37 +820,13 @@ async function monitorToken(
     pool
   );
 
-  shrine.emit(
-    'subscribe',
-    {
-      pool
-    },
-    (ack) => {
-      console.log(
-        'TOKEN PRICE SUBSCRIPTION:',
-        mint,
-        ack
-      );
-    }
-  );
-
-  shrine.emit(
-    'subscribe_trades',
-    {
-      pool
-    },
-    (ack) => {
-      console.log(
-        'TOKEN TRADE SUBSCRIPTION:',
-        mint,
-        ack
-      );
-    }
-  );
-
   await loadMetadata(
     mint,
     pool
+  );
+
+  await subscribeToken(
+    state
   );
 
   state.stopTimer =
@@ -614,36 +846,49 @@ async function monitorToken(
 // UNSUBSCRIBE
 // ------------------------------
 
-function unsubscribeToken(state) {
+function unsubscribeToken(
+  state
+) {
   if (!state) {
     return;
   }
 
   try {
-    if (state.pool) {
+    if (
+      state.pool
+    ) {
       shrine.emit(
         'unsubscribe',
         {
-          pool: state.pool
+          pool:
+            state.pool
         }
       );
 
       shrine.emit(
         'unsubscribe_trades',
         {
-          pool: state.pool
+          pool:
+            state.pool
         }
+      );
+
+      poolToMint.delete(
+        state.pool
       );
     }
   } catch (error) {
     console.log(
       'UNSUBSCRIBE ERROR:',
       state.mint,
-      error.message
+      error?.message ||
+        error
     );
   }
 
-  if (state.stopTimer) {
+  if (
+    state.stopTimer
+  ) {
     clearTimeout(
       state.stopTimer
     );
@@ -660,6 +905,83 @@ function unsubscribeToken(state) {
 }
 
 // ------------------------------
+// LIQUIDITY
+// ------------------------------
+
+function updateLiquidityFromEvent(
+  state,
+  event
+) {
+  const quoteMint =
+    event?.quote ||
+    event?.quoteMint ||
+    state.quoteMint;
+
+  const quoteInPool =
+    safeNumber(
+      event?.quoteInPool ??
+      event?.quote_in_pool ??
+      event?.quoteReserve ??
+      event?.quote_reserve
+    );
+
+  if (
+    quoteMint
+  ) {
+    state.quoteMint =
+      quoteMint;
+  }
+
+  if (
+    quoteInPool > 0
+  ) {
+    state.quoteInPool =
+      quoteInPool;
+  }
+
+  if (
+    state.quoteInPool <= 0
+  ) {
+    return;
+  }
+
+  const WSOL =
+    'So11111111111111111111111111111111111111112';
+
+  const USDC =
+    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGkGZwyTDt1v';
+
+  const USD1 =
+    'USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB';
+
+  const USDT =
+    'Es9vMFrzaCERmJfrF4H2FYD7f1bXfF4gY7xYw4L1u9Y';
+
+  if (
+    quoteMint === WSOL &&
+    solPriceUSD > 0
+  ) {
+    state.liquidityUSD =
+      state.quoteInPool *
+      solPriceUSD *
+      2;
+
+    state.liquidityKnown =
+      true;
+  } else if (
+    quoteMint === USDC ||
+    quoteMint === USD1 ||
+    quoteMint === USDT
+  ) {
+    state.liquidityUSD =
+      state.quoteInPool * 2;
+
+    state.liquidityKnown =
+      true;
+  }
+}
+
+// ------------------------------
 // TOKEN PRICE UPDATE
 // ------------------------------
 
@@ -668,9 +990,7 @@ shrine.on(
   (update) => {
     try {
       const state =
-        getStateByPool(
-          update?.pool
-        );
+        findState(update);
 
       if (!state) {
         return;
@@ -678,43 +998,57 @@ shrine.on(
 
       state.priceUSD =
         safeNumber(
-          update?.priceUSD
+          update?.priceUSD ??
+          update?.price
         );
 
       state.mcapUSD =
         safeNumber(
-          update?.mcapUSD
+          update?.mcapUSD ??
+          update?.mcap
         );
 
-      if (
-        !state.firstPriceUSD &&
-        state.priceUSD > 0
-      ) {
-        state.firstPriceUSD =
-          state.priceUSD;
-      }
-
-      state.latestPriceUSD =
-        state.priceUSD;
-
-      if (
-        state.priceUSD >
-        state.highestPriceUSD
-      ) {
-        state.highestPriceUSD =
-          state.priceUSD;
-      }
+      state.quoteMint =
+        update?.quote ||
+        state.quoteMint;
 
       state.lastUpdateAt =
         Date.now();
 
+      if (
+        state.priceUSD > 0
+      ) {
+        if (
+          !state.firstPriceUSD
+        ) {
+          state.firstPriceUSD =
+            state.priceUSD;
+        }
+
+        state.latestPriceUSD =
+          state.priceUSD;
+
+        state.highestPriceUSD =
+          Math.max(
+            state.highestPriceUSD,
+            state.priceUSD
+          );
+      }
+
       console.log(
         'TOKEN UPDATE:',
         {
-          mint: state.mint,
-          pool: state.pool,
-          price: state.priceUSD,
-          mcap: state.mcapUSD
+          mint:
+            state.mint,
+
+          pool:
+            state.pool,
+
+          priceUSD:
+            state.priceUSD,
+
+          mcapUSD:
+            state.mcapUSD
         }
       );
 
@@ -724,7 +1058,9 @@ shrine.on(
     } catch (error) {
       console.log(
         'TOKEN UPDATE ERROR:',
-        error.message
+        error?.stack ||
+          error?.message ||
+          error
       );
     }
   }
@@ -739,9 +1075,7 @@ shrine.on(
   (trade) => {
     try {
       const state =
-        getStateByPool(
-          trade?.pool
-        );
+        findState(trade);
 
       if (!state) {
         return;
@@ -761,31 +1095,39 @@ shrine.on(
         );
 
       if (!action) {
+        console.log(
+          'TRADE WITHOUT SIDE:',
+          trade
+        );
+
         return;
       }
 
-      state.latestTrade =
-        trade;
+      if (
+        trade?.signature &&
+        trade.signature ===
+          state.lastTradeSignature
+      ) {
+        return;
+      }
+
+      state.lastTradeSignature =
+        trade?.signature ||
+        null;
 
       state.lastTradeAt =
         Date.now();
 
-      state.quoteMint =
-        trade?.quoteMint ||
-        state.quoteMint;
+      if (
+        trade?.quote
+      ) {
+        state.quoteMint =
+          trade.quote;
+      }
 
-      state.quoteInPool =
-        safeNumber(
-          trade?.quoteInPool
-        );
-
-      state.tokensInPool =
-        safeNumber(
-          trade?.tokensInPool
-        );
-
-      updateLiquidity(
-        state
+      updateLiquidityFromEvent(
+        state,
+        trade
       );
 
       if (
@@ -815,11 +1157,7 @@ shrine.on(
             solAmount
           );
         }
-      }
-
-      if (
-        action === 'sell'
-      ) {
+      } else {
         state.sells++;
 
         state.sellVolumeSOL +=
@@ -846,11 +1184,80 @@ shrine.on(
         }
       }
 
+      if (
+        trade?.price &&
+        solPriceUSD > 0 &&
+        state.quoteMint ===
+          'So11111111111111111111111111111111111111112'
+      ) {
+        state.latestPriceUSD =
+          safeNumber(
+            trade.price
+          ) *
+          solPriceUSD;
+
+        if (
+          !state.firstPriceUSD &&
+          state.latestPriceUSD > 0
+        ) {
+          state.firstPriceUSD =
+            state.latestPriceUSD;
+        }
+
+        state.highestPriceUSD =
+          Math.max(
+            state.highestPriceUSD,
+            state.latestPriceUSD
+          );
+      }
+
+      if (
+        trade?.marketcapUSD
+      ) {
+        state.mcapUSD =
+          safeNumber(
+            trade.marketcapUSD
+          );
+      }
+
+      if (
+        trade?.marketcap &&
+        state.mcapUSD <= 0
+      ) {
+        const quote =
+          state.quoteMint;
+
+        if (
+          quote ===
+            'So11111111111111111111111111111111111111112' &&
+          solPriceUSD > 0
+        ) {
+          state.mcapUSD =
+            safeNumber(
+              trade.marketcap
+            ) *
+            solPriceUSD;
+        } else {
+          state.mcapUSD =
+            safeNumber(
+              trade.marketcap
+            );
+        }
+      }
+
       state.recentTrades.push({
-        time: Date.now(),
+        time:
+          Date.now(),
+
         action,
+
         wallet,
-        solAmount
+
+        solAmount,
+
+        signature:
+          trade?.signature ||
+          null
       });
 
       if (
@@ -861,7 +1268,9 @@ shrine.on(
       }
 
       state.buyerTimeline.push({
-        time: Date.now(),
+        time:
+          Date.now(),
+
         buyers:
           state.uniqueBuyers.size
       });
@@ -876,15 +1285,33 @@ shrine.on(
       console.log(
         'TRADE:',
         {
-          mint: state.mint,
+          mint:
+            state.mint,
+
+          pool:
+            state.pool,
+
           action,
+
           wallet:
             wallet
               ? shortAddress(wallet)
               : 'unknown',
+
           solAmount,
+
+          signature:
+            trade?.signature ||
+            'unknown',
+
+          mcapUSD:
+            state.mcapUSD,
+
           liquidityUSD:
-            state.liquidityUSD
+            state.liquidityUSD,
+
+          liquidityKnown:
+            state.liquidityKnown
         }
       );
 
@@ -892,17 +1319,35 @@ shrine.on(
         action === 'sell' &&
         wallet &&
         state.devWallet &&
-        wallet === state.devWallet
+        wallet ===
+          state.devWallet
       ) {
-        sendDeveloperSellAlert(
+        sendDeveloper
+        SellAlert(
           state,
           solAmount,
           trade
+        ).catch(
+          (error) => {
+            console.log(
+              'DEV SELL ALERT ERROR:',
+              error?.message ||
+                error
+            );
+          }
         );
       }
 
       evaluateEliteSniper(
         wallet
+      ).catch(
+        (error) => {
+          console.log(
+            'ELITE SNIPER ERROR:',
+            error?.message ||
+              error
+          );
+        }
       );
 
       evaluateToken(
@@ -911,7 +1356,9 @@ shrine.on(
     } catch (error) {
       console.log(
         'TRADE HANDLER ERROR:',
-        error.message
+        error?.stack ||
+          error?.message ||
+          error
       );
     }
   }
@@ -928,7 +1375,9 @@ function updateWalletStats(
   solAmount
 ) {
   if (
-    !state.walletStats.has(wallet)
+    !state.walletStats.has(
+      wallet
+    )
   ) {
     state.walletStats.set(
       wallet,
@@ -937,7 +1386,8 @@ function updateWalletStats(
         sells: 0,
         buySOL: 0,
         sellSOL: 0,
-        firstSeen: Date.now()
+        firstSeen:
+          Date.now()
       }
     );
   }
@@ -953,11 +1403,7 @@ function updateWalletStats(
     stats.buys++;
     stats.buySOL +=
       solAmount;
-  }
-
-  if (
-    side === 'sell'
-  ) {
+  } else {
     stats.sells++;
     stats.sellSOL +=
       solAmount;
@@ -965,115 +1411,18 @@ function updateWalletStats(
 }
 
 // ------------------------------
-// LIQUIDITY
-// ------------------------------
-
-function updateLiquidity(state) {
-  if (
-    state.quoteInPool <= 0
-  ) {
-    return;
-  }
-
-  const quote =
-    state.quoteMint;
-
-  const WSOL =
-    'So11111111111111111111111111111111111111112';
-
-  const USDC =
-    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGkGZwyTDt1v';
-
-  const USD1 =
-    'USD1ttGY1N17NEEHLmELoaybftRBUrhqYiQzvEmuB';
-
-  const USDT =
-    'Es9vMFrzaCERmJfrF4H2FYD7f1bXfF4gY7xYw4L1u9Y';
-
-  if (
-    quote === WSOL &&
-    solPriceUSD > 0
-  ) {
-    state.liquidityUSD =
-      state.quoteInPool *
-      solPriceUSD *
-      2;
-
-    return;
-  }
-
-  if (
-    quote === USDC ||
-    quote === USD1 ||
-    quote === USDT
-  ) {
-    state.liquidityUSD =
-      state.quoteInPool * 2;
-  }
-}
-
-// ------------------------------
-// DEV SELL ALERT
-// ------------------------------
-
-async function sendDeveloperSellAlert(
-  state,
-  solAmount,
-  trade
-) {
-  if (
-    !state.normalAlertSent
-  ) {
-    return;
-  }
-
-  if (
-    devSellAlertsSent.has(
-      state.mint
-    )
-  ) {
-    return;
-  }
-
-  devSellAlertsSent.add(
-    state.mint
-  );
-
-  const message =
-    `🚨 DEV SELL DETECTED\n\n` +
-    `CA: ${state.mint}\n` +
-    `DEV: ${shortAddress(state.devWallet)}\n` +
-    `Sold: ${solAmount.toFixed(3)} SOL\n` +
-    `MCap: $${Math.round(
-      state.mcapUSD
-    ).toLocaleString()}\n` +
-    `Liquidity: $${Math.round(
-      state.liquidityUSD
-    ).toLocaleString()}\n` +
-    `TX: ${
-      trade?.signature ||
-      'unknown'
-    }`;
-
-  await sendTelegram(
-    message
-  );
-
-  console.log(
-    'DEV SELL ALERT SENT:',
-    state.mint
-  );
-}
-
-// ------------------------------
 // BUY PRESSURE
 // ------------------------------
 
-function getBuyPressure(state) {
+function getBuyPressure(
+  state
+) {
   if (
-    state.sellVolumeSOL <= 0
+    state.sellVolumeSOL <=
+    0
   ) {
-    return state.buyVolumeSOL > 0
+    return state.buyVolumeSOL >
+      0
       ? 3
       : 0;
   }
@@ -1088,15 +1437,17 @@ function getBuyPressure(state) {
 // BUYER GROWTH
 // ------------------------------
 
-function getBuyerGrowth(state) {
-  const now =
-    Date.now();
+function getBuyerGrowth(
+  state
+) {
+  const cutoff =
+    Date.now() -
+    60 * 1000;
 
   const recent =
     state.buyerTimeline.filter(
-      x =>
-        now - x.time <=
-        60 * 1000
+      (item) =>
+        item.time >= cutoff
     );
 
   if (
@@ -1105,17 +1456,12 @@ function getBuyerGrowth(state) {
     return 0;
   }
 
-  const first =
-    recent[0].buyers;
-
-  const last =
-    recent[
-      recent.length - 1
-    ].buyers;
-
   return Math.max(
     0,
-    last - first
+    recent[
+      recent.length - 1
+    ].buyers -
+      recent[0].buyers
   );
 }
 
@@ -1127,7 +1473,8 @@ function getLargestBuyerShare(
   state
 ) {
   if (
-    state.buyVolumeSOL <= 0
+    state.buyVolumeSOL <=
+    0
   ) {
     return 1;
   }
@@ -1138,13 +1485,11 @@ function getLargestBuyerShare(
     const stats
     of state.walletStats.values()
   ) {
-    if (
-      stats.buySOL >
-      largest
-    ) {
-      largest =
-        stats.buySOL;
-    }
+    largest =
+      Math.max(
+        largest,
+        stats.buySOL
+      );
   }
 
   return (
@@ -1157,43 +1502,53 @@ function getLargestBuyerShare(
 // SCORE
 // ------------------------------
 
-function calculateScore(state) {
+function calculateScore(
+  state
+) {
   let score = 0;
 
   if (
-    state.liquidityUSD >=
-    CONFIG.minLiquidityUSD * 2
+    state.liquidityKnown
   ) {
-    score += 20;
-  } else if (
-    state.liquidityUSD >=
-    CONFIG.minLiquidityUSD
-  ) {
-    score += 15;
+    if (
+      state.liquidityUSD >=
+      CONFIG.minLiquidityUSD * 2
+    ) {
+      score += 20;
+    } else if (
+      state.liquidityUSD >=
+      CONFIG.minLiquidityUSD
+    ) {
+      score += 15;
+    }
   }
 
-  // Buyer count contributes to the score,
-  // but is NOT a hard minimum requirement.
   if (
-    state.uniqueBuyers.size >= 5
+    state.uniqueBuyers.size >=
+    5
   ) {
     score += 15;
   } else if (
-    state.uniqueBuyers.size >= 3
+    state.uniqueBuyers.size >=
+    3
   ) {
     score += 12;
   } else if (
-    state.uniqueBuyers.size >= 2
+    state.uniqueBuyers.size >=
+    2
   ) {
     score += 8;
   } else if (
-    state.uniqueBuyers.size >= 1
+    state.uniqueBuyers.size >=
+    1
   ) {
     score += 4;
   }
 
   const buyPressure =
-    getBuyPressure(state);
+    getBuyPressure(
+      state
+    );
 
   if (
     buyPressure >= 2
@@ -1214,8 +1569,10 @@ function calculateScore(state) {
   }
 
   if (
-    state.firstPriceUSD > 0 &&
-    state.latestPriceUSD > 0
+    state.firstPriceUSD >
+      0 &&
+    state.latestPriceUSD >
+      0
   ) {
     const ratio =
       state.latestPriceUSD /
@@ -1236,8 +1593,6 @@ function calculateScore(state) {
     }
   }
 
-  // Market cap is NOT a $100k requirement.
-  // The only minimum MC is $7,000.
   if (
     state.mcapUSD >= 50000
   ) {
@@ -1247,13 +1602,16 @@ function calculateScore(state) {
   ) {
     score += 8;
   } else if (
-    state.mcapUSD >= CONFIG.minMcapUSD
+    state.mcapUSD >=
+    CONFIG.minMcapUSD
   ) {
     score += 4;
   }
 
   const buyerGrowth =
-    getBuyerGrowth(state);
+    getBuyerGrowth(
+      state
+    );
 
   if (
     buyerGrowth >= 5
@@ -1284,33 +1642,38 @@ function calculateScore(state) {
     score += 2;
   }
 
-  const maxScore = 120;
-
   return {
     score,
     percentage:
-      score / maxScore,
-        buyPressure,
+      score / 120,
+    buyPressure,
     buyerGrowth,
     concentration
   };
 }
 
 // ------------------------------
-// SAFETY CHECKS
+// SAFETY
 // ------------------------------
 
-function hasHeavyDumping(state) {
+function hasHeavyDumping(
+  state
+) {
   if (
-    state.sellVolumeSOL <= 0
+    state.sellVolumeSOL <=
+    0
   ) {
     return false;
   }
 
   if (
-    state.buyVolumeSOL <= 0
+    state.buyVolumeSOL <=
+    0
   ) {
-    return state.sellVolumeSOL >= 10;
+    return (
+      state.sellVolumeSOL >=
+      10
+    );
   }
 
   return (
@@ -1319,6 +1682,10 @@ function hasHeavyDumping(state) {
   );
 }
 
+// ------------------------------
+// SIGNAL REASONS
+// ------------------------------
+
 function getSignalReasons(
   state,
   result
@@ -1326,29 +1693,35 @@ function getSignalReasons(
   const reasons = [];
 
   if (
-    state.liquidityUSD >=
-    CONFIG.minLiquidityUSD * 2
+    state.liquidityKnown
   ) {
-    reasons.push(
-      'Strong liquidity'
-    );
-  } else if (
-    state.liquidityUSD >=
-    CONFIG.minLiquidityUSD
-  ) {
-    reasons.push(
-      'Liquidity above $10k'
-    );
+    if (
+      state.liquidityUSD >=
+      CONFIG.minLiquidityUSD * 2
+    ) {
+      reasons.push(
+        'Strong liquidity'
+      );
+    } else if (
+      state.liquidityUSD >=
+      CONFIG.minLiquidityUSD
+    ) {
+      reasons.push(
+        'Liquidity above $10k'
+      );
+    }
   }
 
   if (
-    result.buyPressure >= 2
+    result.buyPressure >=
+    2
   ) {
     reasons.push(
       'Buyers strongly outweigh sellers'
     );
   } else if (
-    result.buyPressure >= 1.25
+    result.buyPressure >=
+    1.25
   ) {
     reasons.push(
       'Positive buyer pressure'
@@ -1356,13 +1729,15 @@ function getSignalReasons(
   }
 
   if (
-    result.buyerGrowth >= 3
+    result.buyerGrowth >=
+    3
   ) {
     reasons.push(
       'Unique buyers are accelerating'
     );
   } else if (
-    result.buyerGrowth >= 1
+    result.buyerGrowth >=
+    1
   ) {
     reasons.push(
       'Holder growth is increasing'
@@ -1370,7 +1745,8 @@ function getSignalReasons(
   }
 
   if (
-    state.uniqueBuyers.size >= 3
+    state.uniqueBuyers.size >=
+    3
   ) {
     reasons.push(
       'Multiple unique buyers'
@@ -1378,7 +1754,8 @@ function getSignalReasons(
   }
 
   if (
-    result.concentration <= 0.30
+    result.concentration <=
+    0.30
   ) {
     reasons.push(
       'Buyer distribution is healthy'
@@ -1386,12 +1763,63 @@ function getSignalReasons(
   }
 
   if (
-    state.latestPriceUSD >
-      state.firstPriceUSD &&
-    state.firstPriceUSD > 0
+    result.volumeGrowth >=
+    1.50
   ) {
     reasons.push(
-      'Price momentum is positive'
+      'Trading volume is growing strongly'
+    );
+  }
+
+  if (
+    result.buyerAcceleration >=
+    0.50
+  ) {
+    reasons.push(
+      'Buyer activity is accelerating'
+    );
+  }
+
+  if (
+    result.buyPressure >=
+    0.60
+  ) {
+    reasons.push(
+      'Buyers are stronger than sellers'
+    );
+  }
+
+  if (
+    result.devHolding < 0.10
+  ) {
+    reasons.push(
+      'Developer holding is below 10%'
+    );
+  }
+
+  if (
+    result.liquidityUSD >=
+    CONFIG.minLiquidityUSD
+  ) {
+    reasons.push(
+      'Liquidity is above the $10k target'
+    );
+  }
+
+  if (
+    result.score >=
+    CONFIG.greenThreshold * 100
+  ) {
+    reasons.push(
+      'Overall momentum is strong'
+    );
+  }
+
+  if (
+    reasons.length === 0
+  ) {
+    reasons.push(
+      'Momentum conditions are developing'
     );
   }
 
@@ -1402,40 +1830,16 @@ function getSignalReasons(
 // TOKEN EVALUATION
 // ------------------------------
 
-function evaluateToken(state) {
+function evaluateToken(
+  state
+) {
   if (!state) {
     return;
   }
 
-  // Minimum market cap is $7,000.
-  // No $100,000 minimum exists.
   if (
-    state.mcapUSD > 0 &&
-    state.mcapUSD <
-      CONFIG.minMcapUSD
-  ) {
-    return;
-  }
-
-  // Do not score tokens until liquidity
-  // can be measured.
-  if (
-    state.liquidityUSD <= 0
-  ) {
-    return;
-  }
-
-  // Thin liquidity is silently ignored.
-  if (
-    state.liquidityUSD <
-    CONFIG.minLiquidityUSD
-  ) {
-    return;
-  }
-
-  // Heavy dumping is a hard safety blocker.
-  if (
-    hasHeavyDumping(state)
+    state.alertSent &&
+    !state.devSellAlertSent
   ) {
     return;
   }
@@ -1443,38 +1847,78 @@ function evaluateToken(state) {
   const result =
     calculateScore(state);
 
-  if (
-    result.percentage >=
-      CONFIG.greenThreshold &&
-    !state.greenSent &&
-    !state.normalAlertSent
-  ) {
-    state.greenSent = true;
-    state.normalAlertSent = true;
-
-    sendNormalAlert(
-      state,
-      'GREEN',
-      result
-    );
-
+  if (!result) {
     return;
   }
 
   if (
-    result.percentage >=
-      CONFIG.orangeThreshold &&
-    !state.orangeSent &&
-    !state.greenSent &&
-    !state.normalAlertSent
+    result.liquidityUSD <
+    CONFIG.minLiquidityUSD
   ) {
-    state.orangeSent = true;
-    state.normalAlertSent = true;
+    return;
+  }
+
+  if (
+    result.mcapUSD <
+    CONFIG.minMcapUSD
+  ) {
+    return;
+  }
+
+  if (
+    result.hardBlocked
+  ) {
+    return;
+  }
+
+  const reasons =
+    signalReasons(
+      state,
+      result
+    );
+
+  let signal =
+    null;
+
+  if (
+    result.score >=
+    CONFIG.greenThreshold * 100
+  ) {
+    signal = 'GREEN';
+  } else if (
+    result.score >=
+    CONFIG.orangeThreshold * 100
+  ) {
+    signal = 'ORANGE';
+  }
+
+  if (!signal) {
+    return;
+  }
+
+  if (
+    !normalAlertsSent.has(
+      state.mint
+    )
+  ) {
+    normalAlertsSent.add(
+      state.mint
+    );
+
+    state.alertSent = true;
 
     sendNormalAlert(
       state,
-      'ORANGE',
-      result
+      signal,
+      result,
+      reasons
+    ).catch(
+      (error) => {
+        console.log(
+          'NORMAL ALERT ERROR:',
+          error.message
+        );
+      }
     );
   }
 }
@@ -1486,68 +1930,105 @@ function evaluateToken(state) {
 async function sendNormalAlert(
   state,
   signal,
-  result
+  result,
+  reasons
+) {
+  const message =
+    [
+      `🚨 ${signal}`,
+      '',
+      `Token: ${
+        state.symbol ||
+        state.name ||
+        'Unknown'
+      }`,
+      `CA: ${state.mint}`,
+      '',
+      `Market Cap: $${Math.round(
+        result.mcapUSD
+      ).toLocaleString()}`,
+      `Liquidity: $${Math.round(
+        result.liquidityUSD
+      ).toLocaleString()}`,
+      `Score: ${result.score.toFixed(1)}%`,
+      '',
+      'Why it triggered:',
+      ...reasons.map(
+        (reason) =>
+          `• ${reason}`
+      )
+    ].join('\n');
+
+  await sendTelegram(
+    message
+  );
+
+  console.log(
+    'NORMAL ALERT SENT:',
+    state.mint,
+    signal
+  );
+}
+
+// ------------------------------
+// DEV SELL ALERT
+// ------------------------------
+
+async function sendDeveloperSellAlert(
+  state,
+  solAmount,
+  trade
 ) {
   if (
-    normalAlertsSent.has(
+    !state ||
+    !state.alertSent
+  ) {
+    return;
+  }
+
+  if (
+    devSellAlertsSent.has(
       state.mint
     )
   ) {
     return;
   }
 
-  normalAlertsSent.add(
+  devSellAlertsSent.add(
     state.mint
   );
 
-  const reasons =
-    getSignalReasons(
-      state,
-      result
+  const devHolding =
+    safeNumber(
+      state.devHolding
     );
 
-  const reasonText =
-    reasons.length > 0
-      ? reasons
-          .map(
-            reason =>
-              `• ${reason}`
-          )
-          .join('\n')
-      : '• Momentum conditions triggered';
-
   const message =
-    `${signal === 'GREEN' ? '🟢' : '🟠'} ${signal} PUMPSWAP\n\n` +
-    `CA: ${state.mint}\n` +
-    `MCap: $${Math.round(
-      state.mcapUSD
-    ).toLocaleString()}\n` +
-    `Price: $${state.latestPriceUSD}\n` +
-    `Liquidity: $${Math.round(
-      state.liquidityUSD
-    ).toLocaleString()}\n` +
-    `Buyers: ${state.uniqueBuyers.size}\n` +
-    `Sellers: ${state.uniqueSellers.size}\n` +
-    `Buys: ${state.buys}\n` +
-    `Sells: ${state.sells}\n` +
-    `Buy pressure: ${result.buyPressure.toFixed(2)}x\n` +
-    `Buyer growth: ${result.buyerGrowth}\n` +
-    `Buyer concentration: ${(result.concentration * 100).toFixed(1)}%\n` +
-    `Score: ${Math.round(
-      result.percentage * 100
-    )}%\n\n` +
-    `WHY IT TRIGGERED:\n` +
-    `${reasonText}\n\n` +
-    `⚠️ Signal only — not a profit guarantee.`;
-
-  console.log(
-    `${signal} SIGNAL:`,
-    state.mint,
-    result
-  );
+    [
+      '⚠️ DEV SELL ALERT',
+      '',
+      `Token: ${
+        state.symbol ||
+        state.name ||
+        'Unknown'
+      }`,
+      `CA: ${state.mint}`,
+      '',
+      `Dev sold: ${solAmount.toFixed(4)} SOL`,
+      `Dev remaining: ${
+        devHolding
+      }%`,
+      '',
+      'This token had already triggered an alert.'
+    ].join('\n');
 
   await sendTelegram(
     message
+  );
+
+  console.log(
+    'DEV SELL ALERT SENT:',
+    state.mint
   );
 }
 
@@ -1555,73 +2036,36 @@ async function sendNormalAlert(
 // ELITE WALLET TRACKING
 // ------------------------------
 
-function updateEliteWallet(
+function trackEliteWallet(
   wallet,
-  state,
-  side,
-  solAmount
+  trade
 ) {
   if (!wallet) {
     return;
   }
 
-  if (
-    !eliteWallets.has(wallet)
-  ) {
-    eliteWallets.set(
-      wallet,
-      {
-        trades: 0,
-        buys: 0,
-        sells: 0,
-        buySOL: 0,
-        sellSOL: 0,
-        tokensSeen: new Set(),
-        successfulTokens: new Set(),
-        firstSeen: Date.now(),
-        lastSeen: Date.now(),
-        suspiciousScore: 0
-      }
-    );
-  }
-
-  const stats =
+  let stats =
     eliteWallets.get(
       wallet
     );
 
-  stats.trades++;
-  stats.lastSeen =
+  if (!stats) {
+    stats = {
+      trades: 0,
+      wins: 0,
+      lastTrade: 0,
+      cooldownUntil: 0
+    };
+
+    eliteWallets.set(
+      wallet,
+      stats
+    );
+  }
+
+  stats.trades += 1;
+  stats.lastTrade =
     Date.now();
-
-  stats.tokensSeen.add(
-    state.mint
-  );
-
-  if (
-    side === 'buy'
-  ) {
-    stats.buys++;
-    stats.buySOL +=
-      solAmount;
-  }
-
-  if (
-    side === 'sell'
-  ) {
-    stats.sells++;
-    stats.sellSOL +=
-      solAmount;
-  }
-
-  if (
-    stats.trades >= 2 &&
-    stats.buys >= 2 &&
-    stats.sellSOL >
-      stats.buySOL * 3
-  ) {
-    stats.suspiciousScore++;
-  }
 }
 
 // ------------------------------
@@ -1652,79 +2096,56 @@ async function evaluateEliteSniper(
   }
 
   if (
-    stats.buys <
+    stats.wins <
     CONFIG.eliteMinWins
   ) {
     return;
   }
 
   if (
-    stats.suspiciousScore >= 3
+    Date.now() <
+    stats.cooldownUntil
   ) {
     return;
   }
-
-  const winRate =
-    stats.buys /
-    Math.max(
-      1,
-      stats.trades
-    );
 
   if (
-    winRate < 0.50
-  ) {
-    return;
-  }
-
-  const now =
-    Date.now();
-
-  const lastAlert =
-    eliteAlertsSent.get(
+    eliteAlertsSent.has(
       wallet
-    ) || 0;
+    )
+  ) {
+    return;
+  }
 
-  if (
-    now - lastAlert <
+  eliteAlertsSent.add(
+    wallet
+  );
+
+  stats.cooldownUntil =
+    Date.now() +
     CONFIG.eliteCooldownMinutes *
       60 *
-      1000
-  ) {
-    return;
-  }
-
-  eliteAlertsSent.set(
-    wallet,
-    now
-  );
-
-  const message =
-    `🎯 ELITE SNIPER WALLET\n\n` +
-    `Wallet: ${wallet}\n` +
-    `Short: ${shortAddress(wallet)}\n` +
-    `Trades: ${stats.trades}\n` +
-    `Buys: ${stats.buys}\n` +
-    `Sells: ${stats.sells}\n` +
-    `Win rate: ${(winRate * 100).toFixed(1)}%\n` +
-    `Tokens seen: ${stats.tokensSeen.size}\n\n` +
-    `⚠️ Wallet signal only — not a profit guarantee.`;
-
-  console.log(
-    'ELITE SNIPER WALLET:',
-    shortAddress(wallet),
-    {
-      trades: stats.trades,
-      buys: stats.buys,
-      sells: stats.sells,
-      tokensSeen:
-        stats.tokensSeen.size,
-      winRate
-    }
-  );
+      1000;
 
   await sendTelegram(
-    message
+    [
+      '🎯 ELITE SNIPER',
+      '',
+      `Wallet: ${shortAddress(
+        wallet
+      )}`,
+      `Trades tracked: ${
+        stats.trades
+      }`,
+      `Wins tracked: ${
+        stats.wins
+      }`
+    ].join('\n')
+  );
+
+  console.log(
+    'ELITE SNIPER ALERT:',
+    wallet
   );
 }
 
@@ -1732,74 +2153,51 @@ async function evaluateEliteSniper(
 // CLEANUP
 // ------------------------------
 
-setInterval(
-  () => {
-    const cutoff =
-      Date.now() -
-      CONFIG.maxMonitorMinutes *
-        60 *
-        1000;
+function cleanupToken(
+  mint
+) {
+  const state =
+    monitored.get(
+      mint
+    );
 
-    for (
-      const state
-      of monitored.values()
-    ) {
-      if (
-        state.startedAt <
-        cutoff
-      ) {
-        unsubscribeToken(
-          state
-        );
-      }
+  if (!state) {
+    return;
+  }
+
+  if (
+    state.pool
+  ) {
+    poolToMint.delete(
+      state.pool
+    );
+
+    try {
+      shrine.emit(
+        'unsubscribe',
+        {
+          pool: state.pool
+        }
+      );
+
+      shrine.emit(
+        'unsubscribe_trades',
+        {
+          pool: state.pool
+        }
+      );
+    } catch (error) {
+      console.log(
+        'UNSUBSCRIBE ERROR:',
+        error.message
+      );
     }
+  }
 
-    if (
-      normalAlertsSent.size >
-      10000
-    ) {
-      normalAlertsSent.clear();
-    }
-
-    if (
-      devSellAlertsSent.size >
-      10000
-    ) {
-      devSellAlertsSent.clear();
-    }
-
-    if (
-      eliteAlertsSent.size >
-      10000
-    ) {
-      eliteAlertsSent.clear();
-    }
-
-    const walletCutoff =
-      Date.now() -
-      24 *
-      60 *
-      60 *
-      1000;
-
-    for (
-      const [
-        wallet,
-        stats
-      ] of eliteWallets
-    ) {
-      if (
-        stats.lastSeen <
-        walletCutoff
-      ) {
-        eliteWallets.delete(
-          wallet
-        );
-      }
-    }
-  },
-  60 * 1000
-);
+  monitored.delete(
+    mint
+  );
+}
 
 // ------------------------------
 // STATUS
@@ -1807,60 +2205,38 @@ setInterval(
 
 app.get(
   '/api/status',
-  (_req, res) => {
+  (req, res) => {
     res.json({
       ok: true,
-      protocols: ['PUMPFUN'],
-      source: CONFIG.source,
-      autoTrading:
-        CONFIG.autoTrading,
-
-      scannerActive,
-
-      minMcapUSD:
-        CONFIG.minMcapUSD,
-
-      maxMonitorMinutes:
-        CONFIG.maxMonitorMinutes,
-
-      minLiquidityUSD:
-        CONFIG.minLiquidityUSD,
-
-      orangeThreshold:
-        CONFIG.orangeThreshold,
-
-      greenThreshold:
-        CONFIG.greenThreshold,
-
+      shrineConnected:
+        shrine.connected,
+      telegramEnabled,
       monitoredTokens:
         monitored.size,
-
-      eliteWallets:
-        eliteWallets.size,
-
-      telegramEnabled,
-
-      solPriceUSD,
-
-      signals: [
-        'GREEN',
-        'ORANGE',
-        'ELITE_SNIPER',
-        'DEV_SELL'
-      ]
+      normalAlerts:
+        normalAlertsSent.size,
+      devSellAlerts:
+        devSellAlertsSent.size,
+      eliteAlerts:
+        eliteAlertsSent.size,
+      source:
+        CONFIG.source,
+      autoTrading:
+        CONFIG.autoTrading
     });
   }
 );
 
-// ------------------------------
-// HEALTH
-// ------------------------------
-
 app.get(
   '/health',
-  (_req, res) => {
+  (req, res) => {
     res.json({
-      ok: true
+      ok: true,
+      shrineConnected:
+        shrine.connected,
+      telegramEnabled,
+      monitored:
+        monitored.size
     });
   }
 );
@@ -1901,42 +2277,7 @@ app.listen(
     );
 
     console.log(
-      'SOURCE:',
-      CONFIG.source
-    );
-
-    console.log(
-      'AUTO TRADING:',
-      CONFIG.autoTrading
-    );
-
-    console.log(
-      'TELEGRAM ENABLED:',
-      telegramEnabled
-    );
-
-    console.log(
-      'MIN MC:',
-      CONFIG.minMcapUSD
-    );
-
-    console.log(
-      'MONITOR WINDOW:',
-      CONFIG.maxMonitorMinutes,
-      'minutes'
-    );
-
-    console.log(
-      'MIN LIQUIDITY:',
-      CONFIG.minLiquidityUSD
-    );
-
-    console.log(
-      'SCHEDULE:',
-      CONFIG.workMinutes,
-      'minutes ON /',
-      CONFIG.restMinutes,
-      'minutes OFF'
+      'SHRINE TRADE STREAM: READY'
     );
   }
-);
+); 
