@@ -1215,20 +1215,15 @@ async function sendDeveloperSellAlert(
       : 'unavailable';
 
   const message = [
-    '⚠️ DEV SELL AFTER ALERT',
-    '',
-    `${state.name || 'Unknown Token'} ${state.symbol ? `(${state.symbol})` : ''}`,
-    `CA: ${state.mint}`,
-    `Dev: ${shortAddress(
-      state.devWallet
-    )}`,
-    `Sold: ${solAmount.toFixed(4)} SOL`,
-    `Remaining dev holding: ${holding}`,
-    `Tx: ${
-      getSignature(trade) ||
-      'unavailable'
-    }`
-  ].join('\n');
+  '⚠️ DEV SELL AFTER ALERT',
+  '',
+  `${state.name || 'Unknown Token'} ${state.symbol ? `(${state.symbol})` : ''}`,
+  `CA: ${state.mint}`,
+  `Dev: ${shortAddress(state.devWallet)}`,
+  `Sold: ${solAmount.toFixed(4)} SOL`,
+  `Remaining dev holding: ${holding}`,
+  `Tx: ${getSignature(trade) || 'unavailable'}`
+].join('\n');
 
   await sendTelegram(
     message
