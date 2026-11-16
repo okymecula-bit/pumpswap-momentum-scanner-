@@ -1215,7 +1215,7 @@ async function sendDeveloperSellAlert(
       : 'unavailable';
 
   const message = [
-  '⚠️ DEV SELL AFTER ALERT',
+  'DEV SELL AFTER ALERT',
   '',
   `${state.name || 'Unknown Token'} ${state.symbol ? `(${state.symbol})` : ''}`,
   `CA: ${state.mint}`,
